@@ -1,0 +1,182 @@
+# -------------------------------------------------------------------
+# parameters
+# -------------------------------------------------------------------
+parameters:
+  - name: environments
+    type: object
+    default:
+      - name: uat
+        pool: ubuntu-latest
+        databricksCatalog: uat_catalog
+      - name: prod
+        pool: ubuntu-latest
+        databricksCatalog: prod_catalog
+
+  - name: services
+    type: object
+    default:
+      - name: databricks
+        script: scripts/deploy/deploy_databricks_assets.sh
+      - name: infra
+        script: scripts/deploy/deploy_infra_resources.sh
+
+# -------------------------------------------------------------------
+# triggers
+# -------------------------------------------------------------------
+trigger:
+  branches:
+    include:
+      - develop
+      - feature/*
+  paths:
+    include:
+      - pipelines/**
+      - scripts/**
+      - configs/**
+
+pr:
+  branches:
+    include:
+      - develop
+
+# -------------------------------------------------------------------
+# resources & variables
+# -------------------------------------------------------------------
+resources:
+  repositories:
+    - repository: self
+      type: git
+  containers:
+    - container: python
+      image: mcr.microsoft.com/azure-devops/python:3.8
+
+variables:
+  - name: databricksHost
+    value: $(DATABRICKS_HOST)
+  - name: databricksToken
+    value: $(DATABRICKS_TOKEN)
+  - group: SharedSecrets # Azure Key Vault-backed variable group
+
+# -------------------------------------------------------------------
+# reusable anchors
+# -------------------------------------------------------------------
+.pool-template: &pool-template
+  vmImage: ubuntu-latest
+
+.lint-steps: &lint-steps
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: "3.9"
+  - script: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+      flake8 scripts/ tests/
+    displayName: "Install & Lint"
+
+# -------------------------------------------------------------------
+# stages
+# -------------------------------------------------------------------
+stages:
+  - stage: Build
+    displayName: 🚧 Build & Lint
+    jobs:
+      - job: Lint
+        displayName: Code Lint
+        pool: *pool-template
+        steps: *lint-steps
+
+      - job: UnitTests
+        displayName: 🧪 Unit Tests
+        dependsOn: Lint
+        pool: *pool-template
+        steps:
+          - script: |
+              pip install pytest
+              pytest --maxfail=1 --disable-warnings -q
+            displayName: "Run pytest"
+
+  - stage: Publish
+    displayName: 📦 Publish Artifacts
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: Pack
+        displayName: Create Package
+        pool: *pool-template
+        steps:
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/package
+              cp -R scripts/ $(Build.ArtifactStagingDirectory)/package/
+            displayName: "Stage package"
+          - publish: $(Build.ArtifactStagingDirectory)/package
+            artifact: dtb_assets
+
+  - stage: Deploy
+    displayName: 🚀 Deploy to All Environments
+    dependsOn: Publish
+    strategy:
+      matrix:
+        UAT:
+          envName: uat
+        PROD:
+          envName: prod
+    jobs:
+      - deployment: Deploy_${{ matrix.envName | upper }}
+        displayName: Deploy to ${{ matrix.envName | upper }}
+        environment: ${{ matrix.envName }}
+        pool: &deploy-pool
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureKeyVault@2
+                  name: FetchSecrets
+                  inputs:
+                    azureSubscription: "MyAzureSvcConn"
+                    KeyVaultName: "kv-databricks-${{ matrix.envName }}"
+                    SecretsFilter: "databricks-*,infra-*"
+                - download: current
+                  artifact: dtb_assets
+                - script: |
+                    chmod +x scripts/deploy/*.sh
+                    ./scripts/deploy/deploy_infra_resources.sh --env ${{ matrix.envName }}
+                  displayName: "Deploy Infra"
+                - script: |
+                    ./scripts/deploy/deploy_databricks_assets.sh \
+                    --host $(databricksHost) \
+                    --token $(databricksToken) \
+                    --catalog ${{ parameters.environments[($.matrixIndex)].databricksCatalog }}
+                  displayName: "Deploy Databricks Assets"
+                - task: ManualValidation@0
+                  inputs:
+                    notifyUsers: "team@databricks.com"
+                    instructions: "Approve promotion to ${{ matrix.envName | upper }}"
+                    onTimeout: "reject"
+                    timeout: "60"
+                  displayName: "Manual Approval"
+
+  - stage: PostDeployChecks
+    displayName: 🔍 Post-Deployment Health Checks
+    dependsOn: Deploy
+    condition: succeeded()
+    jobs:
+      - job: SmokeTests
+        displayName: Smoke Tests
+        pool: *pool-template
+        steps:
+          - script: |
+              pip install requests
+              python tests/smoke/run_smoke_tests.py --env $(deploy.environment.name)
+            displayName: "Run smoke tests"
+      - job: Report
+        displayName: Generate Report
+        pool: *pool-template
+        steps:
+          - script: |
+              python scripts/validate/generate_deployment_report.py \
+                --env $(deploy.environment.name) \
+                --output report_$(Build.BuildId).html
+            displayName: "Generate HTML report"
+          - publish: report_$(Build.BuildId).html
+            artifact: DeploymentReport
